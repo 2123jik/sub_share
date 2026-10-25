@@ -42,7 +42,7 @@ jobs:
 
           BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
           REV_FILE = ".last_sync_rev"
-          MAX_WORKERS = 32  # 开启 6 个线程并发拉取，既能跑满速度又不会把站长服务器打崩
+          MAX_WORKERS = 16  # 建议 16 左右。32 个同时握手容易被原站小服务器判定为CC攻击或连接重置
 
           def run(cmd):
               return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -110,7 +110,7 @@ jobs:
           print_lock = threading.Lock()
 
           def download_single_file(item):
-              nonlocal completed_count
+              global completed_count  # 关键修复：使用 global
               rel_path, file_url = item
               os.makedirs(os.path.dirname(rel_path), exist_ok=True)
               
