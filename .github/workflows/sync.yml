@@ -18,7 +18,7 @@ jobs:
       - name: 2. 安装 SVN 工具
         run: sudo apt-get update -qq && sudo apt-get install -y subversion
 
-      - name: 3. 毫秒级日志解析与高速追更
+      - name: 3. 毫秒级日志解析与多线程极速追更
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -29,6 +29,8 @@ jobs:
           import sys
           import time
           import shutil
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import threading
 
           SVN_OPTS = [
               "--username", "test",
@@ -40,6 +42,7 @@ jobs:
 
           BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
           REV_FILE = ".last_sync_rev"
+          MAX_WORKERS = 6  # 开启 6 个线程并发拉取，既能跑满速度又不会把站长服务器打崩
 
           def run(cmd):
               return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -54,77 +57,106 @@ jobs:
           head_rev = int(info.stdout.strip())
           print(f"[+] 原站当前最新版本: r{head_rev}", flush=True)
 
-          # 2. 确定追踪的起始版本号
+          # 2. 确定追踪区间
           if os.path.exists(REV_FILE):
               with open(REV_FILE, "r") as f:
                   start_rev = int(f.read().strip())
               if start_rev >= head_rev:
                   print(f"[SUCCESS] 本地已经是最新版本 (r{head_rev})，无需更新！", flush=True)
                   sys.exit(0)
-              print(f"[*] 执行日常更新: r{start_rev + 1} -> r{head_rev}", flush=True)
+              print(f"[*] 执行增量追更: r{start_rev + 1} -> r{head_rev}", flush=True)
               query_start = start_rev + 1
           else:
-              # 站长总共 783 次提交，迁移时在 700 多次。
-              # 首次运行从 r700 开始扫描所有日志，0.5 秒即可读完！
               query_start = max(1, head_rev - 85)
-              print(f"[!] 首次运行检测：从迁移分界点 r{query_start} 开始极速扫描日志追更...", flush=True)
+              print(f"[!] 首次运行检测：从 r{query_start} 提取日志追更...", flush=True)
 
-          # 3. 秒级读取 SVN 日志中的变动文件清单 (读取 XML 索引，绝不傻等 diff)
-          print(f"[*] 正在拉取 r{query_start}:r{head_rev} 的变动日志索引 (通常耗时 1~2 秒)...", flush=True)
+          # 3. 秒级提取变动文件清单
+          print(f"[*] 正在拉取 r{query_start}:r{head_rev} 的变动日志索引...", flush=True)
           log_cmd = ["svn", "log", "-v", "--xml", f"-r{query_start}:{head_rev}", BASE_SVN] + SVN_OPTS
           log_res = run(log_cmd)
           if log_res.returncode != 0:
               print(f"[-] 获取日志失败: {log_res.stderr}", flush=True)
               sys.exit(1)
 
-          # 解析变更的文件
           root = ET.fromstring(log_res.stdout)
-          # 使用 dict 记录最新动作，自动去重
           file_actions = {}
 
           for logentry in root.findall("logentry"):
-              rev = logentry.get("revision")
               paths = logentry.findall("./paths/path")
               for p in paths:
-                  action = p.get("action") # A: 增加, M: 修改, D: 删除
+                  action = p.get("action")
                   path_text = p.text
                   if path_text and "/subs_list/" in path_text:
                       rel_path = path_text.split("/trunk/")[-1]
                       file_actions[rel_path] = action
 
-          total_changes = len(file_actions)
-          print(f"[+] 索引解析完毕！共识别到 {total_changes} 个变动文件，开始精准下载：\n", flush=True)
-
-          current_idx = 0
-          for rel_path, action in file_actions.items():
-              current_idx += 1
-              file_url = f"{BASE_SVN}/{rel_path}"
-
-              if action in ["A", "M"]:
-                  print(f"[{current_idx}/{total_changes}] 下载新番字幕: {rel_path}", flush=True)
-                  os.makedirs(os.path.dirname(rel_path), exist_ok=True)
-                  # 纯单文件导出，只耗几 KB
-                  run(["svn", "export", "--force", file_url, rel_path] + SVN_OPTS)
-              elif action == "D":
+          # 先把删除操作瞬间处理完
+          for rel_path, action in list(file_actions.items()):
+              if action == "D":
                   if os.path.exists(rel_path):
-                      print(f"[{current_idx}/{total_changes}] 删除失效文件: {rel_path}", flush=True)
                       if os.path.isdir(rel_path):
                           shutil.rmtree(rel_path, ignore_errors=True)
                       else:
                           os.remove(rel_path)
+                  del file_actions[rel_path]
 
-          # 4. 写入最新版本号
+          download_list = [(path, f"{BASE_SVN}/{path}") for path in file_actions.keys()]
+          total_files = len(download_list)
+          print(f"[+] 索引解析完毕！共有 {total_files} 个字幕文件需要下载。", flush=True)
+          print(f"[*] 已启动 {MAX_WORKERS} 个并发通道并行加速拉取...\n", flush=True)
+
+          # 4. 多线程并发极速下载
+          completed_count = 0
+          print_lock = threading.Lock()
+
+          def download_single_file(item):
+              nonlocal completed_count
+              rel_path, file_url = item
+              os.makedirs(os.path.dirname(rel_path), exist_ok=True)
+              
+              # 单文件尝试下载，最多重试 3 次，防止网络抖动
+              for attempt in range(3):
+                  try:
+                      res = subprocess.run(
+                          ["svn", "export", "--force", file_url, rel_path] + SVN_OPTS,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          timeout=25  # 25秒超时防卡死
+                      )
+                      if res.returncode == 0:
+                          with print_lock:
+                              completed_count += 1
+                              print(f"[{completed_count}/{total_files}] 完成: {rel_path}", flush=True)
+                          return True
+                  except subprocess.TimeoutExpired:
+                      pass
+                  time.sleep(1)
+
+              with print_lock:
+                  print(f"[WARN] 文件拉取超时跳过: {rel_path}", flush=True)
+              return False
+
+          start_time = time.time()
+          with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+              futures = [executor.submit(download_single_file, item) for item in download_list]
+              for future in as_completed(futures):
+                  future.result()
+
+          elapsed = round(time.time() - start_time, 1)
+          print(f"\n[+] 全体并发下载完毕！总计耗时: {elapsed} 秒", flush=True)
+
+          # 5. 更新本地版本记录
           with open(REV_FILE, "w") as f:
               f.write(str(head_rev))
 
-          # 5. 推送入库
+          # 6. 一键提交并推送到 GitHub
           run(["git", "config", "user.name", "github-actions[bot]"])
           run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
           run(["git", "add", "-A"])
           
           status = run(["git", "status", "--porcelain"]).stdout.strip()
           if status:
-              commit_msg = f"sync: catch up to r{head_rev} ({total_changes} files updated)"
+              commit_msg = f"sync: catch up to r{head_rev} ({total_files} files, {elapsed}s)"
               print(f"\n[*] 正在将新字幕推送回你的 GitHub: {commit_msg}", flush=True)
               run(["git", "commit", "-m", commit_msg])
               run(["git", "pull", "--rebase", "origin", "main"])
@@ -134,5 +166,5 @@ jobs:
               else:
                   print(f"[-] 推送失败: {push_res.stderr}", flush=True)
           else:
-              print("\n[+] 所有变动文件已存在，无需额外提交，同步完成。", flush=True)
+              print("\n[+] 本地已有最新数据，无需额外提交，同步完成。", flush=True)
           EOF
