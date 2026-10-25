@@ -4,11 +4,13 @@ on:
   schedule:
     # 每天自动极速巡检 2 次（北京时间 8点 和 20点）
     - cron: '0 0,12 * * *'
-  workflow_dispatch: # 随时支持在 GitHub Actions 页面手动点击运行
+  workflow_dispatch: # 支持手动点击运行
 
 jobs:
   fast_sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 确保 Actions 拥有写入/推送权限
     steps:
       - name: 1. 检出当前仓库
         uses: actions/checkout@v4
@@ -18,7 +20,7 @@ jobs:
       - name: 2. 安装 SVN 工具
         run: sudo apt-get update -qq && sudo apt-get install -y subversion
 
-      - name: 3. 毫秒级日志解析与多线程极速追更
+      - name: 3. 分批断点追更与实时推送
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -42,10 +44,18 @@ jobs:
 
           BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
           REV_FILE = ".last_sync_rev"
-          MAX_WORKERS = 16  # 建议 16 左右。32 个同时握手容易被原站小服务器判定为CC攻击或连接重置
+          MAX_WORKERS = 16  # 并发数
+          BATCH_REVS = 10   # 每 10 个 SVN 版本保存推送一次（断点检查点）
 
           def run(cmd):
               return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+          # 0. 配置 Git 基础信息并确认当前分支
+          run(["git", "config", "user.name", "github-actions[bot]"])
+          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
+          branch_res = run(["git", "branch", "--show-current"]).stdout.strip()
+          target_branch = branch_res if branch_res else "master"
+          print(f"[*] 当前推送目标分支为: {target_branch}", flush=True)
 
           # 1. 询问原站当前的最新版本号
           print("[*] 正在连接原站 SVN 查询最新版本...", flush=True)
@@ -62,109 +72,106 @@ jobs:
               with open(REV_FILE, "r") as f:
                   start_rev = int(f.read().strip())
               if start_rev >= head_rev:
-                  print(f"[SUCCESS] 本地已经是最新版本 (r{head_rev})，无需更新！", flush=True)
+                  print(f"[SUCCESS] 本地已是最新版本 (r{head_rev})，无需更新！", flush=True)
                   sys.exit(0)
-              print(f"[*] 执行增量追更: r{start_rev + 1} -> r{head_rev}", flush=True)
+              print(f"[*] 检测到断点进度，执行增量追更: r{start_rev + 1} -> r{head_rev}", flush=True)
               query_start = start_rev + 1
           else:
               query_start = max(1, head_rev - 85)
-              print(f"[!] 首次运行检测：从 r{query_start} 提取日志追更...", flush=True)
+              print(f"[!] 首次追更：从 r{query_start} 到 r{head_rev} 分批进行...", flush=True)
 
-          # 3. 秒级提取变动文件清单
-          print(f"[*] 正在拉取 r{query_start}:r{head_rev} 的变动日志索引...", flush=True)
-          log_cmd = ["svn", "log", "-v", "--xml", f"-r{query_start}:{head_rev}", BASE_SVN] + SVN_OPTS
-          log_res = run(log_cmd)
-          if log_res.returncode != 0:
-              print(f"[-] 获取日志失败: {log_res.stderr}", flush=True)
-              sys.exit(1)
+          # 3. 按批次循环处理并及时 commit/push（防爆机制）
+          current_rev = query_start
+          while current_rev <= head_rev:
+              batch_end = min(current_rev + BATCH_REVS - 1, head_rev)
+              print(f"\n=======================================================", flush=True)
+              print(f"[*] 开始处理批次: r{current_rev} -> r{batch_end} (总目标: r{head_rev})", flush=True)
+              print(f"=======================================================", flush=True)
 
-          root = ET.fromstring(log_res.stdout)
-          file_actions = {}
+              log_cmd = ["svn", "log", "-v", "--xml", f"-r{current_rev}:{batch_end}", BASE_SVN] + SVN_OPTS
+              log_res = run(log_cmd)
+              if log_res.returncode != 0:
+                  print(f"[-] 获取日志失败: {log_res.stderr}", flush=True)
+                  sys.exit(1)
 
-          for logentry in root.findall("logentry"):
-              paths = logentry.findall("./paths/path")
-              for p in paths:
-                  action = p.get("action")
-                  path_text = p.text
-                  if path_text and "/subs_list/" in path_text:
-                      rel_path = path_text.split("/trunk/")[-1]
-                      file_actions[rel_path] = action
+              root = ET.fromstring(log_res.stdout)
+              file_actions = {}
+              for logentry in root.findall("logentry"):
+                  for p in logentry.findall("./paths/path"):
+                      action = p.get("action")
+                      path_text = p.text
+                      if path_text and "/subs_list/" in path_text:
+                          rel_path = path_text.split("/trunk/")[-1]
+                          file_actions[rel_path] = action
 
-          # 先把删除操作瞬间处理完
-          for rel_path, action in list(file_actions.items()):
-              if action == "D":
-                  if os.path.exists(rel_path):
-                      if os.path.isdir(rel_path):
-                          shutil.rmtree(rel_path, ignore_errors=True)
-                      else:
-                          os.remove(rel_path)
-                  del file_actions[rel_path]
+              # 删除操作
+              for rel_path, action in list(file_actions.items()):
+                  if action == "D":
+                      if os.path.exists(rel_path):
+                          if os.path.isdir(rel_path):
+                              shutil.rmtree(rel_path, ignore_errors=True)
+                          else:
+                              os.remove(rel_path)
+                      del file_actions[rel_path]
 
-          download_list = [(path, f"{BASE_SVN}/{path}") for path in file_actions.keys()]
-          total_files = len(download_list)
-          print(f"[+] 索引解析完毕！共有 {total_files} 个字幕文件需要下载。", flush=True)
-          print(f"[*] 已启动 {MAX_WORKERS} 个并发通道并行加速拉取...\n", flush=True)
+              download_list = [(path, f"{BASE_SVN}/{path}") for path in file_actions.keys()]
+              total_files = len(download_list)
+              print(f"[+] 该批次有 {total_files} 个文件变更", flush=True)
 
-          # 4. 多线程并发极速下载
-          completed_count = 0
-          print_lock = threading.Lock()
+              if total_files > 0:
+                  completed_count = 0
+                  print_lock = threading.Lock()
 
-          def download_single_file(item):
-              global completed_count  # 关键修复：使用 global
-              rel_path, file_url = item
-              os.makedirs(os.path.dirname(rel_path), exist_ok=True)
-              
-              # 单文件尝试下载，最多重试 3 次，防止网络抖动
-              for attempt in range(3):
-                  try:
-                      res = subprocess.run(
-                          ["svn", "export", "--force", file_url, rel_path] + SVN_OPTS,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          timeout=25  # 25秒超时防卡死
-                      )
-                      if res.returncode == 0:
-                          with print_lock:
-                              completed_count += 1
-                              print(f"[{completed_count}/{total_files}] 完成: {rel_path}", flush=True)
-                          return True
-                  except subprocess.TimeoutExpired:
-                      pass
-                  time.sleep(1)
+                  def download_single_file(item):
+                      nonlocal completed_count
+                      rel_path, file_url = item
+                      os.makedirs(os.path.dirname(rel_path), exist_ok=True)
+                      for attempt in range(3):
+                          try:
+                              res = subprocess.run(
+                                  ["svn", "export", "--force", file_url, rel_path] + SVN_OPTS,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  timeout=25
+                              )
+                              if res.returncode == 0:
+                                  with print_lock:
+                                      completed_count += 1
+                                      if completed_count % 50 == 0 or completed_count == total_files:
+                                          print(f"[{completed_count}/{total_files}] 完成", flush=True)
+                                  return True
+                          except subprocess.TimeoutExpired:
+                              pass
+                          time.sleep(1)
+                      with print_lock:
+                          print(f"[WARN] 跳过拉取超时文件: {rel_path}", flush=True)
+                      return False
 
-              with print_lock:
-                  print(f"[WARN] 文件拉取超时跳过: {rel_path}", flush=True)
-              return False
+                  start_time = time.time()
+                  with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                      futures = [executor.submit(download_single_file, item) for item in download_list]
+                      for f in as_completed(futures):
+                          f.result()
+                  print(f"[+] 批次下载完成，耗时 {round(time.time() - start_time, 1)} 秒", flush=True)
 
-          start_time = time.time()
-          with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-              futures = [executor.submit(download_single_file, item) for item in download_list]
-              for future in as_completed(futures):
-                  future.result()
+              # 更新检查点版本号并提交
+              with open(REV_FILE, "w") as f:
+                  f.write(str(batch_end))
 
-          elapsed = round(time.time() - start_time, 1)
-          print(f"\n[+] 全体并发下载完毕！总计耗时: {elapsed} 秒", flush=True)
+              run(["git", "add", "-A"])
+              status = run(["git", "status", "--porcelain"]).stdout.strip()
+              if status:
+                  commit_msg = f"sync: checkpoint up to r{batch_end}"
+                  print(f"[*] 正在推送进度到 GitHub: {commit_msg}", flush=True)
+                  run(["git", "commit", "-m", commit_msg])
+                  run(["git", "pull", "--rebase", "origin", target_branch])
+                  push_res = run(["git", "push", "origin", f"HEAD:{target_branch}"])
+                  if push_res.returncode != 0:
+                      print(f"[-] 推送失败: {push_res.stderr}", flush=True)
+                      sys.exit(1)
+                  print(f"[✓] 成功推送到 r{batch_end}！", flush=True)
 
-          # 5. 更新本地版本记录
-          with open(REV_FILE, "w") as f:
-              f.write(str(head_rev))
+              current_rev = batch_end + 1
 
-          # 6. 一键提交并推送到 GitHub
-          run(["git", "config", "user.name", "github-actions[bot]"])
-          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
-          run(["git", "add", "-A"])
-          
-          status = run(["git", "status", "--porcelain"]).stdout.strip()
-          if status:
-              commit_msg = f"sync: catch up to r{head_rev} ({total_files} files, {elapsed}s)"
-              print(f"\n[*] 正在将新字幕推送回你的 GitHub: {commit_msg}", flush=True)
-              run(["git", "commit", "-m", commit_msg])
-              run(["git", "pull", "--rebase", "origin", "main"])
-              push_res = run(["git", "push", "origin", "main"])
-              if push_res.returncode == 0:
-                  print(f"\n[SUCCESS] 追更全部完成！你的仓库已和原站 r{head_rev} 丝毫不差！", flush=True)
-              else:
-                  print(f"[-] 推送失败: {push_res.stderr}", flush=True)
-          else:
-              print("\n[+] 本地已有最新数据，无需额外提交，同步完成。", flush=True)
+          print("\n[SUCCESS] 全部追更顺利完成，已和原站版本完全一致！", flush=True)
           EOF
