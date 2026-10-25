@@ -42,7 +42,7 @@ jobs:
 
           BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
           REV_FILE = ".last_sync_rev"
-          MAX_WORKERS = 6  # 开启 6 个线程并发拉取，既能跑满速度又不会把站长服务器打崩
+          MAX_WORKERS = 32  # 开启 6 个线程并发拉取，既能跑满速度又不会把站长服务器打崩
 
           def run(cmd):
               return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
