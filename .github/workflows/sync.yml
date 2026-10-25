@@ -1,0 +1,131 @@
+name: High-Speed Sub Sync
+
+on:
+  schedule:
+    # 每天自动极速巡检 2 次（北京时间 8点 和 20点）
+    - cron: '0 0,12 * * *'
+  workflow_dispatch: # 随时支持在 GitHub Actions 页面手动点击运行
+
+jobs:
+  fast_sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 2. 安装 SVN 工具
+        run: sudo apt-get update -qq && sudo apt-get install -y subversion
+
+      - name: 3. 极速增量补齐与日常追更
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python3 -u - << 'EOF'
+          import subprocess
+          import os
+          import sys
+          import time
+          import shutil
+
+          SVN_OPTS = [
+              "--username", "test",
+              "--password", "",
+              "--no-auth-cache",
+              "--non-interactive",
+              "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"
+          ]
+
+          BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
+          REV_FILE = ".last_sync_rev"
+
+          def run(cmd):
+              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+          # 1. 询问原站当前的最新版本号
+          print("[*] 正在连接原站 SVN 查询最新版本...", flush=True)
+          info = run(["svn", "info", "--show-item", "revision", BASE_SVN] + SVN_OPTS)
+          if info.returncode != 0:
+              print(f"[-] 连接失败: {info.stderr}", flush=True)
+              sys.exit(1)
+
+          head_rev = int(info.stdout.strip())
+          print(f"[+] 原站当前最新版本: r{head_rev}", flush=True)
+
+          # 2. 确定本次对比的起点
+          if os.path.exists(REV_FILE):
+              with open(REV_FILE, "r") as f:
+                  start_point = f.read().strip()
+              # 如果上次已经同步到最新版，直接秒级退出
+              if start_point.isdigit() and int(start_point) >= head_rev:
+                  print(f"[SUCCESS] 你的仓库已经完全同步到最新版 (r{head_rev})，原站没有任何新字幕！", flush=True)
+                  sys.exit(0)
+              revision_range = f"-r{start_point}:{head_rev}"
+              print(f"[*] 执行日常增量同步，区间: {start_point} -> r{head_rev}", flush=True)
+          else:
+              # 关键亮点：第一次运行，直接以站长在 GitHub 封号断更的 2025-09-22 作为起点！
+              revision_range = f"-r{{2025-09-22}}:{head_rev}"
+              print(f"[!] 首次运行检测：以原站 GitHub 断更日 (2025-09-22) 为起点，无缝补齐全部 2026 新番！", flush=True)
+
+          # 3. 瞬间获取原站发生过变动的文件清单
+          diff_cmd = ["svn", "diff", "--summarize", revision_range, BASE_SVN] + SVN_OPTS
+          diff_res = run(diff_cmd)
+          if diff_res.returncode != 0:
+              print(f"[-] 查询差异清单失败: {diff_res.stderr}", flush=True)
+              sys.exit(1)
+
+          changes = diff_res.stdout.strip().splitlines()
+          print(f"[+] 成功捕捉到 {len(changes)} 处字幕变动记录，开始高速同步...", flush=True)
+          updated_files = 0
+
+          for line in changes:
+              if not line.strip():
+                  continue
+              parts = line.strip().split()
+              action = parts[0]    # A: 新增, M: 修改, D: 删除
+              file_url = parts[-1]
+
+              if "/subs_list/" not in file_url:
+                  continue
+
+              rel_path = file_url.split("/trunk/")[-1]
+
+              # 如果原站有新字幕或更新字幕，秒级下载
+              if action in ["A", "M"]:
+                  print(f"  [+] 下载新番字幕: {rel_path}", flush=True)
+                  os.makedirs(os.path.dirname(rel_path), exist_ok=True)
+                  run(["svn", "export", "--force", file_url, rel_path] + SVN_OPTS)
+                  updated_files += 1
+              elif action == "D":
+                  if os.path.exists(rel_path):
+                      print(f"  [-] 删除失效文件: {rel_path}", flush=True)
+                      if os.path.isdir(rel_path):
+                          shutil.rmtree(rel_path, ignore_errors=True)
+                      else:
+                          os.remove(rel_path)
+                      updated_files += 1
+
+          # 4. 把最新版本号写入记录文件
+          with open(REV_FILE, "w") as f:
+              f.write(str(head_rev))
+
+          # 5. 推送回你自己的 GitHub
+          run(["git", "config", "user.name", "github-actions[bot]"])
+          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
+          run(["git", "add", "-A"])
+          
+          status = run(["git", "status", "--porcelain"]).stdout.strip()
+          if status:
+              commit_msg = f"sync: catch up to r{head_rev} ({updated_files} files updated)"
+              print(f"\n[*] 正在将新番字幕存入 GitHub: {commit_msg}", flush=True)
+              run(["git", "commit", "-m", commit_msg])
+              run(["git", "pull", "--rebase", "origin", "main"])
+              push_res = run(["git", "push", "origin", "main"])
+              if push_res.returncode == 0:
+                  print(f"[SUCCESS] 搞定！已完美补齐并同步到原站最新的 r{head_rev}！", flush=True)
+              else:
+                  print(f"[-] 推送失败: {push_res.stderr}", flush=True)
+          else:
+              print("[+] 文件已经全部处于最新状态，无需提交。", flush=True)
+          EOF
