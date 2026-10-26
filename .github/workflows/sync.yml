@@ -17,18 +17,17 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 2. 安装系统工具 (SVN 与 XML解析器)
-        run: sudo apt-get update -qq && sudo apt-get install -y subversion xmlstarlet
+      - name: 2. 安装 SVN 工具
+        run: sudo apt-get update -qq && sudo apt-get install -y subversion
 
-      - name: 3. 分批断点追更与实时推送 (纯 Bash 驱动)
+      - name: 3. 分批断点追更与整批同步
         run: |
           set -e
 
-          # 基础配置
           BASE_SVN="https://svn.acgdev.com:505/svn/sub_share/trunk"
+          SUB_FOLDER="subs_list"
           REV_FILE=".last_sync_rev"
-          MAX_WORKERS=8    # 降低瞬时高并发，防止被原站防CC/限流断开连接
-          BATCH_REVS=10    # 每 10 个 SVN 版本保存推送一次
+          BATCH_REVS=10   # 每 10 个 SVN 版本同步保存一次
 
           SVN_OPTS=(
             "--username" "test"
@@ -38,18 +37,18 @@ jobs:
             "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"
           )
 
-          # 0. 配置 Git 身份
+          # 0. 配置 Git 基础信息
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           TARGET_BRANCH=$(git branch --show-current)
           TARGET_BRANCH=${TARGET_BRANCH:-master}
           echo "[*] 当前推送目标分支为: $TARGET_BRANCH"
 
-          # 1. 查询原站当前的最新版本号
+          # 1. 询问原站当前的最新版本号
           echo "[*] 正在连接原站 SVN 查询最新版本..."
           HEAD_REV=$(svn info --show-item revision "${SVN_OPTS[@]}" "$BASE_SVN" 2>/dev/null || true)
           if [[ -z "$HEAD_REV" || ! "$HEAD_REV" =~ ^[0-9]+$ ]]; then
-            echo "[-] 连接原站失败，未能获取 revision"
+            echo "[-] 连接失败，无法获取 SVN 版本号"
             exit 1
           fi
           echo "[+] 原站当前最新版本: r$HEAD_REV"
@@ -69,32 +68,7 @@ jobs:
             echo "[!] 首次追更：从 r$QUERY_START 到 r$HEAD_REV 分批进行..."
           fi
 
-          # 3. 创建安全下载器（杜绝文件名空格/括号/单引号解析转义爆炸）
-          cat << 'HELPER' > /tmp/svn_download.sh
-          #!/usr/bin/env bash
-          rel_path="$1"
-          base_svn="$2"
-          shift 2
-          opts=("$@")
-
-          dir_name="$(dirname "$rel_path")"
-          mkdir -p "$dir_name"
-          file_url="${base_svn}/${rel_path}"
-
-          # 重试 3 次，超时 35 秒
-          for attempt in 1 2 3; do
-            if timeout 35 svn export --force "${opts[@]}" "$file_url" "$rel_path" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 1
-          done
-
-          echo "[WARN] 拉取失败或超时: $rel_path" >&2
-          exit 0
-          HELPER
-          chmod +x /tmp/svn_download.sh
-
-          # 4. 按批次循环追更
+          # 3. 按批次循环整批同步
           CURRENT_REV=$QUERY_START
           while [[ $CURRENT_REV -le $HEAD_REV ]]; do
             BATCH_END=$((CURRENT_REV + BATCH_REVS - 1))
@@ -104,44 +78,39 @@ jobs:
 
             echo ""
             echo "======================================================="
-            echo "[*] 开始处理批次: r$CURRENT_REV -> r$BATCH_END (总目标: r$HEAD_REV)"
+            echo "[*] 开始整批同步至版本: r$BATCH_END (总目标: r$HEAD_REV)"
             echo "======================================================="
 
-            LOG_XML=$(mktemp)
-            if ! svn log -v --xml -r "${CURRENT_REV}:${BATCH_END}" "${SVN_OPTS[@]}" "$BASE_SVN" > "$LOG_XML"; then
-              echo "[-] 获取 SVN 日志失败"
-              rm -f "$LOG_XML"
-              exit 1
-            fi
+            # 检查这个版本区间内 subs_list 到底有没有改动，没改动直接跳过网络拉取
+            LOG_DIFF=$(svn log -r "${CURRENT_REV}:${BATCH_END}" -q "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" 2>/dev/null || true)
 
-            # A. 处理删除（删除文件或目录）
-            xmlstarlet sel -t -m "//path[@action='D']" -v "." -n "$LOG_XML" 2>/dev/null | grep "/subs_list/" | while IFS= read -r full_path; do
-              rel_path="${full_path#*/trunk/}"
-              if [[ -e "$rel_path" ]]; then
-                echo "[-] 删除: $rel_path"
-                rm -rf "$rel_path"
+            if [[ -n "$LOG_DIFF" ]]; then
+              echo "[+] 检测到此区间内 subs_list 有更新，使用原生整批导流同步..."
+              
+              # 直接使用 SVN 官方单连接流式导出，自动覆盖，完美支持所有中文、特殊字符与空格！
+              # 如果原站有删除文件，先用 rsync 或清理旧目录，直接整个目录一次性对齐目标版本：
+              TMP_EXPORT_DIR=$(mktemp -d)
+              
+              if ! svn export --force -r "$BATCH_END" "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" "$TMP_EXPORT_DIR/$SUB_FOLDER"; then
+                echo "[-] 批次导出失败，重试中..."
+                sleep 2
+                svn export --force -r "$BATCH_END" "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" "$TMP_EXPORT_DIR/$SUB_FOLDER"
               fi
-            done
 
-            # B. 提取新增/变更（关键：严格剔除目录 kind='dir'，只拉取纯文件！）
-            DL_LIST=$(mktemp)
-            xmlstarlet sel -t -m "//path[@kind='file' and (@action='A' or @action='M' or @action='R')]" -v "." -n "$LOG_XML" 2>/dev/null \
-              | grep "/subs_list/" \
-              | sed 's|^.*/trunk/||' \
-              | sort -u > "$DL_LIST"
-
-            TOTAL_FILES=$(wc -l < "$DL_LIST" | tr -d '[:space:]')
-            echo "[+] 该批次有 $TOTAL_FILES 个有效文件变更"
-
-            if [[ "$TOTAL_FILES" -gt 0 ]]; then
-              # 使用 xargs 原生并发并行下载，安全分隔，绝不丢失任何带空格的文件
-              cat "$DL_LIST" | xargs -d '\n' -P "$MAX_WORKERS" -I {} /tmp/svn_download.sh "{}" "$BASE_SVN" "${SVN_OPTS[@]}"
+              # 将导出的内容精准对齐到本地（自动同步增删改，杜绝孤儿文件）
+              mkdir -p "$SUB_FOLDER"
+              rm -rf "$SUB_FOLDER"
+              mv "$TMP_EXPORT_DIR/$SUB_FOLDER" ./
+              rm -rf "$TMP_EXPORT_DIR"
+              echo "[+] 目录对齐完成"
+            else
+              echo "[*] 该区间内 subs_list 无变更，直接推进进度"
             fi
 
-            # C. 记录检查点并推送到 Git
+            # 保存断点
             echo "$BATCH_END" > "$REV_FILE"
-            rm -f "$LOG_XML" "$DL_LIST"
 
+            # 提交并推送到 Git
             git add -A
             if ! git diff --cached --quiet; then
               COMMIT_MSG="sync: checkpoint up to r$BATCH_END"
@@ -149,15 +118,16 @@ jobs:
               git commit -m "$COMMIT_MSG"
               git pull --rebase origin "$TARGET_BRANCH" || true
               if ! git push origin "HEAD:$TARGET_BRANCH"; then
-                echo "[-] 推送失败"
+                echo "[-] Git 推送失败"
                 exit 1
               fi
-              echo "[✓] 成功推送到 r$BATCH_END！"
+              echo "[✓] 成功同步并推送到 r$BATCH_END！"
+            else
+              echo "[*] 工作区无新变动，仅推进断点"
             fi
 
             CURRENT_REV=$((BATCH_END + 1))
           done
 
-          rm -f /tmp/svn_download.sh
           echo ""
           echo "[SUCCESS] 全部追更顺利完成，已和原站版本完全一致！"
