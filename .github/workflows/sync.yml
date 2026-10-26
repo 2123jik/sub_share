@@ -119,11 +119,10 @@ jobs:
               print(f"[+] 该批次有 {total_files} 个文件变更", flush=True)
 
               if total_files > 0:
-                  completed_count = 0
+                  counter = [0]  # 改用容器对象避开变量作用域 Bug
                   print_lock = threading.Lock()
 
                   def download_single_file(item):
-                      nonlocal completed_count
                       rel_path, file_url = item
                       os.makedirs(os.path.dirname(rel_path), exist_ok=True)
                       for attempt in range(3):
@@ -136,9 +135,9 @@ jobs:
                               )
                               if res.returncode == 0:
                                   with print_lock:
-                                      completed_count += 1
-                                      if completed_count % 50 == 0 or completed_count == total_files:
-                                          print(f"[{completed_count}/{total_files}] 完成", flush=True)
+                                      counter[0] += 1
+                                      if counter[0] % 50 == 0 or counter[0] == total_files:
+                                          print(f"[{counter[0]}/{total_files}] 完成", flush=True)
                                   return True
                           except subprocess.TimeoutExpired:
                               pass
