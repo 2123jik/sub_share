@@ -2,132 +2,46 @@ name: High-Speed Sub Sync
 
 on:
   schedule:
-    # 每天自动极速巡检 2 次（北京时间 8点 和 20点）
-    - cron: '0 0,12 * * *'
-  workflow_dispatch: # 支持手动点击运行
+    - cron: '0 0,12 * * *' # 每天两次
+  workflow_dispatch:        # 支持手动运行
 
 jobs:
-  fast_sync:
+  sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 确保 Actions 拥有写入/推送权限
+      contents: write
     steps:
-      - name: 1. 检出当前仓库
-        uses: actions/checkout@v4
+      - name: 1. 一键腾出 40GB+ 磁盘空间（避免 Disk quota exceeded）
+        uses: jlumbroso/free-disk-space@main
         with:
-          fetch-depth: 1
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
 
-      - name: 2. 安装 SVN 工具
+      - name: 2. 检出当前 Git 仓库
+        uses: actions/checkout@v4
+
+      - name: 3. 安装 SVN
         run: sudo apt-get update -qq && sudo apt-get install -y subversion
 
-      - name: 3. 分批断点追更与整批同步
+      - name: 4. 直接同步最新 SVN 内容并推送到 GitHub
         run: |
-          set -e
+          # 原地强制覆盖导出，不占用额外的临时目录
+          svn export --force \
+            --username test --password "" --no-auth-cache --non-interactive \
+            --trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other \
+            https://svn.acgdev.com:505/svn/sub_share/trunk/subs_list ./subs_list
 
-          BASE_SVN="https://svn.acgdev.com:505/svn/sub_share/trunk"
-          SUB_FOLDER="subs_list"
-          REV_FILE=".last_sync_rev"
-          BATCH_REVS=10   # 每 10 个 SVN 版本同步保存一次
-
-          SVN_OPTS=(
-            "--username" "test"
-            "--password" ""
-            "--no-auth-cache"
-            "--non-interactive"
-            "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"
-          )
-
-          # 0. 配置 Git 基础信息
+          # 提交变动
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          TARGET_BRANCH=$(git branch --show-current)
-          TARGET_BRANCH=${TARGET_BRANCH:-master}
-          echo "[*] 当前推送目标分支为: $TARGET_BRANCH"
-
-          # 1. 询问原站当前的最新版本号
-          echo "[*] 正在连接原站 SVN 查询最新版本..."
-          HEAD_REV=$(svn info --show-item revision "${SVN_OPTS[@]}" "$BASE_SVN" 2>/dev/null || true)
-          if [[ -z "$HEAD_REV" || ! "$HEAD_REV" =~ ^[0-9]+$ ]]; then
-            echo "[-] 连接失败，无法获取 SVN 版本号"
-            exit 1
+          git add subs_list
+          
+          # 仅在有更新时提交推送
+          if ! git diff --staged --quiet; then
+            git commit -m "sync: auto update from svn ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+            git push
           fi
-          echo "[+] 原站当前最新版本: r$HEAD_REV"
-
-          # 2. 确定追踪区间
-          if [[ -f "$REV_FILE" ]]; then
-            START_REV=$(tr -d '[:space:]' < "$REV_FILE")
-            if [[ "$START_REV" -ge "$HEAD_REV" ]]; then
-              echo "[SUCCESS] 本地已是最新版本 (r$HEAD_REV)，无需更新！"
-              exit 0
-            fi
-            QUERY_START=$((START_REV + 1))
-            echo "[*] 检测到断点进度，执行增量追更: r$QUERY_START -> r$HEAD_REV"
-          else
-            QUERY_START=$((HEAD_REV - 85))
-            if [[ $QUERY_START -lt 1 ]]; then QUERY_START=1; fi
-            echo "[!] 首次追更：从 r$QUERY_START 到 r$HEAD_REV 分批进行..."
-          fi
-
-          # 3. 按批次循环整批同步
-          CURRENT_REV=$QUERY_START
-          while [[ $CURRENT_REV -le $HEAD_REV ]]; do
-            BATCH_END=$((CURRENT_REV + BATCH_REVS - 1))
-            if [[ $BATCH_END -gt $HEAD_REV ]]; then
-              BATCH_END=$HEAD_REV
-            fi
-
-            echo ""
-            echo "======================================================="
-            echo "[*] 开始整批同步至版本: r$BATCH_END (总目标: r$HEAD_REV)"
-            echo "======================================================="
-
-            # 检查这个版本区间内 subs_list 到底有没有改动，没改动直接跳过网络拉取
-            LOG_DIFF=$(svn log -r "${CURRENT_REV}:${BATCH_END}" -q "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" 2>/dev/null || true)
-
-            if [[ -n "$LOG_DIFF" ]]; then
-              echo "[+] 检测到此区间内 subs_list 有更新，使用原生整批导流同步..."
-              
-              # 直接使用 SVN 官方单连接流式导出，自动覆盖，完美支持所有中文、特殊字符与空格！
-              # 如果原站有删除文件，先用 rsync 或清理旧目录，直接整个目录一次性对齐目标版本：
-              TMP_EXPORT_DIR=$(mktemp -d)
-              
-              if ! svn export --force -r "$BATCH_END" "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" "$TMP_EXPORT_DIR/$SUB_FOLDER"; then
-                echo "[-] 批次导出失败，重试中..."
-                sleep 2
-                svn export --force -r "$BATCH_END" "${SVN_OPTS[@]}" "$BASE_SVN/$SUB_FOLDER" "$TMP_EXPORT_DIR/$SUB_FOLDER"
-              fi
-
-              # 将导出的内容精准对齐到本地（自动同步增删改，杜绝孤儿文件）
-              mkdir -p "$SUB_FOLDER"
-              rm -rf "$SUB_FOLDER"
-              mv "$TMP_EXPORT_DIR/$SUB_FOLDER" ./
-              rm -rf "$TMP_EXPORT_DIR"
-              echo "[+] 目录对齐完成"
-            else
-              echo "[*] 该区间内 subs_list 无变更，直接推进进度"
-            fi
-
-            # 保存断点
-            echo "$BATCH_END" > "$REV_FILE"
-
-            # 提交并推送到 Git
-            git add -A
-            if ! git diff --cached --quiet; then
-              COMMIT_MSG="sync: checkpoint up to r$BATCH_END"
-              echo "[*] 正在推送进度到 GitHub: $COMMIT_MSG"
-              git commit -m "$COMMIT_MSG"
-              git pull --rebase origin "$TARGET_BRANCH" || true
-              if ! git push origin "HEAD:$TARGET_BRANCH"; then
-                echo "[-] Git 推送失败"
-                exit 1
-              fi
-              echo "[✓] 成功同步并推送到 r$BATCH_END！"
-            else
-              echo "[*] 工作区无新变动，仅推进断点"
-            fi
-
-            CURRENT_REV=$((BATCH_END + 1))
-          done
-
-          echo ""
-          echo "[SUCCESS] 全部追更顺利完成，已和原站版本完全一致！"
