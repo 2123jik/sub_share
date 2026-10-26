@@ -17,160 +17,147 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 2. 安装 SVN 工具
-        run: sudo apt-get update -qq && sudo apt-get install -y subversion
+      - name: 2. 安装系统工具 (SVN 与 XML解析器)
+        run: sudo apt-get update -qq && sudo apt-get install -y subversion xmlstarlet
 
-      - name: 3. 分批断点追更与实时推送
-        env:
-          PYTHONUNBUFFERED: "1"
+      - name: 3. 分批断点追更与实时推送 (纯 Bash 驱动)
         run: |
-          python3 -u - << 'EOF'
-          import subprocess
-          import xml.etree.ElementTree as ET
-          import os
-          import sys
-          import time
-          import shutil
-          from concurrent.futures import ThreadPoolExecutor, as_completed
-          import threading
+          set -e
 
-          SVN_OPTS = [
-              "--username", "test",
-              "--password", "",
-              "--no-auth-cache",
-              "--non-interactive",
-              "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"
-          ]
+          # 基础配置
+          BASE_SVN="https://svn.acgdev.com:505/svn/sub_share/trunk"
+          REV_FILE=".last_sync_rev"
+          MAX_WORKERS=8    # 降低瞬时高并发，防止被原站防CC/限流断开连接
+          BATCH_REVS=10    # 每 10 个 SVN 版本保存推送一次
 
-          BASE_SVN = "https://svn.acgdev.com:505/svn/sub_share/trunk"
-          REV_FILE = ".last_sync_rev"
-          MAX_WORKERS = 16  # 并发数
-          BATCH_REVS = 10   # 每 10 个 SVN 版本保存推送一次（断点检查点）
+          SVN_OPTS=(
+            "--username" "test"
+            "--password" ""
+            "--no-auth-cache"
+            "--non-interactive"
+            "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other"
+          )
 
-          def run(cmd):
-              return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          # 0. 配置 Git 身份
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TARGET_BRANCH=$(git branch --show-current)
+          TARGET_BRANCH=${TARGET_BRANCH:-master}
+          echo "[*] 当前推送目标分支为: $TARGET_BRANCH"
 
-          # 0. 配置 Git 基础信息并确认当前分支
-          run(["git", "config", "user.name", "github-actions[bot]"])
-          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
-          branch_res = run(["git", "branch", "--show-current"]).stdout.strip()
-          target_branch = branch_res if branch_res else "master"
-          print(f"[*] 当前推送目标分支为: {target_branch}", flush=True)
-
-          # 1. 询问原站当前的最新版本号
-          print("[*] 正在连接原站 SVN 查询最新版本...", flush=True)
-          info = run(["svn", "info", "--show-item", "revision", BASE_SVN] + SVN_OPTS)
-          if info.returncode != 0:
-              print(f"[-] 连接失败: {info.stderr}", flush=True)
-              sys.exit(1)
-
-          head_rev = int(info.stdout.strip())
-          print(f"[+] 原站当前最新版本: r{head_rev}", flush=True)
+          # 1. 查询原站当前的最新版本号
+          echo "[*] 正在连接原站 SVN 查询最新版本..."
+          HEAD_REV=$(svn info --show-item revision "${SVN_OPTS[@]}" "$BASE_SVN" 2>/dev/null || true)
+          if [[ -z "$HEAD_REV" || ! "$HEAD_REV" =~ ^[0-9]+$ ]]; then
+            echo "[-] 连接原站失败，未能获取 revision"
+            exit 1
+          fi
+          echo "[+] 原站当前最新版本: r$HEAD_REV"
 
           # 2. 确定追踪区间
-          if os.path.exists(REV_FILE):
-              with open(REV_FILE, "r") as f:
-                  start_rev = int(f.read().strip())
-              if start_rev >= head_rev:
-                  print(f"[SUCCESS] 本地已是最新版本 (r{head_rev})，无需更新！", flush=True)
-                  sys.exit(0)
-              print(f"[*] 检测到断点进度，执行增量追更: r{start_rev + 1} -> r{head_rev}", flush=True)
-              query_start = start_rev + 1
-          else:
-              query_start = max(1, head_rev - 85)
-              print(f"[!] 首次追更：从 r{query_start} 到 r{head_rev} 分批进行...", flush=True)
+          if [[ -f "$REV_FILE" ]]; then
+            START_REV=$(tr -d '[:space:]' < "$REV_FILE")
+            if [[ "$START_REV" -ge "$HEAD_REV" ]]; then
+              echo "[SUCCESS] 本地已是最新版本 (r$HEAD_REV)，无需更新！"
+              exit 0
+            fi
+            QUERY_START=$((START_REV + 1))
+            echo "[*] 检测到断点进度，执行增量追更: r$QUERY_START -> r$HEAD_REV"
+          else
+            QUERY_START=$((HEAD_REV - 85))
+            if [[ $QUERY_START -lt 1 ]]; then QUERY_START=1; fi
+            echo "[!] 首次追更：从 r$QUERY_START 到 r$HEAD_REV 分批进行..."
+          fi
 
-          # 3. 按批次循环处理并及时 commit/push（防爆机制）
-          current_rev = query_start
-          while current_rev <= head_rev:
-              batch_end = min(current_rev + BATCH_REVS - 1, head_rev)
-              print(f"\n=======================================================", flush=True)
-              print(f"[*] 开始处理批次: r{current_rev} -> r{batch_end} (总目标: r{head_rev})", flush=True)
-              print(f"=======================================================", flush=True)
+          # 3. 创建安全下载器（杜绝文件名空格/括号/单引号解析转义爆炸）
+          cat << 'HELPER' > /tmp/svn_download.sh
+          #!/usr/bin/env bash
+          rel_path="$1"
+          base_svn="$2"
+          shift 2
+          opts=("$@")
 
-              log_cmd = ["svn", "log", "-v", "--xml", f"-r{current_rev}:{batch_end}", BASE_SVN] + SVN_OPTS
-              log_res = run(log_cmd)
-              if log_res.returncode != 0:
-                  print(f"[-] 获取日志失败: {log_res.stderr}", flush=True)
-                  sys.exit(1)
+          dir_name="$(dirname "$rel_path")"
+          mkdir -p "$dir_name"
+          file_url="${base_svn}/${rel_path}"
 
-              root = ET.fromstring(log_res.stdout)
-              file_actions = {}
-              for logentry in root.findall("logentry"):
-                  for p in logentry.findall("./paths/path"):
-                      action = p.get("action")
-                      path_text = p.text
-                      if path_text and "/subs_list/" in path_text:
-                          rel_path = path_text.split("/trunk/")[-1]
-                          file_actions[rel_path] = action
+          # 重试 3 次，超时 35 秒
+          for attempt in 1 2 3; do
+            if timeout 35 svn export --force "${opts[@]}" "$file_url" "$rel_path" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
 
-              # 删除操作
-              for rel_path, action in list(file_actions.items()):
-                  if action == "D":
-                      if os.path.exists(rel_path):
-                          if os.path.isdir(rel_path):
-                              shutil.rmtree(rel_path, ignore_errors=True)
-                          else:
-                              os.remove(rel_path)
-                      del file_actions[rel_path]
+          echo "[WARN] 拉取失败或超时: $rel_path" >&2
+          exit 0
+          HELPER
+          chmod +x /tmp/svn_download.sh
 
-              download_list = [(path, f"{BASE_SVN}/{path}") for path in file_actions.keys()]
-              total_files = len(download_list)
-              print(f"[+] 该批次有 {total_files} 个文件变更", flush=True)
+          # 4. 按批次循环追更
+          CURRENT_REV=$QUERY_START
+          while [[ $CURRENT_REV -le $HEAD_REV ]]; do
+            BATCH_END=$((CURRENT_REV + BATCH_REVS - 1))
+            if [[ $BATCH_END -gt $HEAD_REV ]]; then
+              BATCH_END=$HEAD_REV
+            fi
 
-              if total_files > 0:
-                  counter = [0]  # 改用容器对象避开变量作用域 Bug
-                  print_lock = threading.Lock()
+            echo ""
+            echo "======================================================="
+            echo "[*] 开始处理批次: r$CURRENT_REV -> r$BATCH_END (总目标: r$HEAD_REV)"
+            echo "======================================================="
 
-                  def download_single_file(item):
-                      rel_path, file_url = item
-                      os.makedirs(os.path.dirname(rel_path), exist_ok=True)
-                      for attempt in range(3):
-                          try:
-                              res = subprocess.run(
-                                  ["svn", "export", "--force", file_url, rel_path] + SVN_OPTS,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE,
-                                  timeout=25
-                              )
-                              if res.returncode == 0:
-                                  with print_lock:
-                                      counter[0] += 1
-                                      if counter[0] % 50 == 0 or counter[0] == total_files:
-                                          print(f"[{counter[0]}/{total_files}] 完成", flush=True)
-                                  return True
-                          except subprocess.TimeoutExpired:
-                              pass
-                          time.sleep(1)
-                      with print_lock:
-                          print(f"[WARN] 跳过拉取超时文件: {rel_path}", flush=True)
-                      return False
+            LOG_XML=$(mktemp)
+            if ! svn log -v --xml -r "${CURRENT_REV}:${BATCH_END}" "${SVN_OPTS[@]}" "$BASE_SVN" > "$LOG_XML"; then
+              echo "[-] 获取 SVN 日志失败"
+              rm -f "$LOG_XML"
+              exit 1
+            fi
 
-                  start_time = time.time()
-                  with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                      futures = [executor.submit(download_single_file, item) for item in download_list]
-                      for f in as_completed(futures):
-                          f.result()
-                  print(f"[+] 批次下载完成，耗时 {round(time.time() - start_time, 1)} 秒", flush=True)
+            # A. 处理删除（删除文件或目录）
+            xmlstarlet sel -t -m "//path[@action='D']" -v "." -n "$LOG_XML" 2>/dev/null | grep "/subs_list/" | while IFS= read -r full_path; do
+              rel_path="${full_path#*/trunk/}"
+              if [[ -e "$rel_path" ]]; then
+                echo "[-] 删除: $rel_path"
+                rm -rf "$rel_path"
+              fi
+            done
 
-              # 更新检查点版本号并提交
-              with open(REV_FILE, "w") as f:
-                  f.write(str(batch_end))
+            # B. 提取新增/变更（关键：严格剔除目录 kind='dir'，只拉取纯文件！）
+            DL_LIST=$(mktemp)
+            xmlstarlet sel -t -m "//path[@kind='file' and (@action='A' or @action='M' or @action='R')]" -v "." -n "$LOG_XML" 2>/dev/null \
+              | grep "/subs_list/" \
+              | sed 's|^.*/trunk/||' \
+              | sort -u > "$DL_LIST"
 
-              run(["git", "add", "-A"])
-              status = run(["git", "status", "--porcelain"]).stdout.strip()
-              if status:
-                  commit_msg = f"sync: checkpoint up to r{batch_end}"
-                  print(f"[*] 正在推送进度到 GitHub: {commit_msg}", flush=True)
-                  run(["git", "commit", "-m", commit_msg])
-                  run(["git", "pull", "--rebase", "origin", target_branch])
-                  push_res = run(["git", "push", "origin", f"HEAD:{target_branch}"])
-                  if push_res.returncode != 0:
-                      print(f"[-] 推送失败: {push_res.stderr}", flush=True)
-                      sys.exit(1)
-                  print(f"[✓] 成功推送到 r{batch_end}！", flush=True)
+            TOTAL_FILES=$(wc -l < "$DL_LIST" | tr -d '[:space:]')
+            echo "[+] 该批次有 $TOTAL_FILES 个有效文件变更"
 
-              current_rev = batch_end + 1
+            if [[ "$TOTAL_FILES" -gt 0 ]]; then
+              # 使用 xargs 原生并发并行下载，安全分隔，绝不丢失任何带空格的文件
+              cat "$DL_LIST" | xargs -d '\n' -P "$MAX_WORKERS" -I {} /tmp/svn_download.sh "{}" "$BASE_SVN" "${SVN_OPTS[@]}"
+            fi
 
-          print("\n[SUCCESS] 全部追更顺利完成，已和原站版本完全一致！", flush=True)
-          EOF
+            # C. 记录检查点并推送到 Git
+            echo "$BATCH_END" > "$REV_FILE"
+            rm -f "$LOG_XML" "$DL_LIST"
+
+            git add -A
+            if ! git diff --cached --quiet; then
+              COMMIT_MSG="sync: checkpoint up to r$BATCH_END"
+              echo "[*] 正在推送进度到 GitHub: $COMMIT_MSG"
+              git commit -m "$COMMIT_MSG"
+              git pull --rebase origin "$TARGET_BRANCH" || true
+              if ! git push origin "HEAD:$TARGET_BRANCH"; then
+                echo "[-] 推送失败"
+                exit 1
+              fi
+              echo "[✓] 成功推送到 r$BATCH_END！"
+            fi
+
+            CURRENT_REV=$((BATCH_END + 1))
+          done
+
+          rm -f /tmp/svn_download.sh
+          echo ""
+          echo "[SUCCESS] 全部追更顺利完成，已和原站版本完全一致！"
